@@ -80,6 +80,7 @@ var doltCommand = cli.NewSubCommandHandler("dolt", "it's git for data", []cli.Co
 	tblcmds.Commands,
 	cnfcmds.Commands,
 	commands.SendMetricsCmd{},
+	commands.LevelTableFileCmd{},
 	dumpDocsCommand,
 	commands.MigrateCmd{},
 	indexcmds.Commands,

@@ -27,6 +27,7 @@ import (
 	"fmt"
 
 	"golang.org/x/sync/errgroup"
+	"github.com/fatih/color"
 
 	"github.com/dolthub/dolt/go/store/d"
 )
@@ -39,6 +40,41 @@ var EmptyMap Map
 
 type Map struct {
 	orderedSequence
+}
+
+func DebugVisitMap(m Map) []string {
+	_, err := fmt.Fprintf(color.Error, "Made it to DebugVisitMap\n")
+	if err != nil {
+		panic(err)
+	}
+	curLevel := []Map{m}
+	allhashes := []string{}
+	for len(curLevel) > 0 {
+		nextLevel := []Map{}
+		for _, m := range curLevel {
+			if metaSeq, ok := m.orderedSequence.(metaSequence); ok {
+				ts, err := metaSeq.tuples()
+				if err != nil {
+					panic(err)
+				}
+				for _, t := range ts {
+					r, err := t.ref()
+					if err != nil {
+						panic(err)
+					}
+					allhashes = append(allhashes, r.TargetHash().String())
+					v, err := r.TargetValue(context.Background(), m.valueReadWriter())
+					if err != nil {
+						panic(err)
+					}
+					nextLevel = append(nextLevel, v.(Map))
+				}
+			} else if _, ok := m.orderedSequence.(mapLeafSequence); ok {
+			}
+		}
+		curLevel = nextLevel
+	}
+	return allhashes
 }
 
 func newMap(seq orderedSequence) Map {
