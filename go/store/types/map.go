@@ -70,6 +70,15 @@ func DebugVisitMap(m Map) []string {
 					nextLevel = append(nextLevel, v.(Map))
 				}
 			} else if _, ok := m.orderedSequence.(mapLeafSequence); ok {
+				//_, err := fmt.Fprintf(color.Output, "skipping leaf node\n")
+				//if err != nil {
+				//	panic(err)
+				//}
+			} else {
+				_, err := fmt.Fprintf(color.Output, "unexpectedly encountered else clause in DebugVisitMap\n")
+				if err != nil {
+					panic(err)
+				}
 			}
 		}
 		curLevel = nextLevel

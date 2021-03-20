@@ -42,6 +42,7 @@ const (
 	manifestFileName = "manifest"
 	lockFileName     = "LOCK"
 
+	appendixFileName     = "appendix"
 	storageVersion4 = "4"
 
 	prefixLen = 5
@@ -102,6 +103,46 @@ func MaybeMigrateFileManifest(ctx context.Context, dir string) (bool, error) {
 	return true, err
 }
 
+// todo this aint gone work
+func MaybeMigrateFileAppendix(ctx context.Context, dir string) (bool, error) {
+	_, err := os.Stat(filepath.Join(dir, appendixFileName))
+	if os.IsNotExist(err) {
+		// no manifest exists, no need to migrate
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+
+	fm5 := fileManifestV5{dir}
+	ok, _, err := fm5.ParseIfExists(ctx, &Stats{}, nil)
+	if ok && err == nil {
+		// on v5, no need to migrate
+		return false, nil
+	}
+
+	fm4 := fileManifestV4{dir}
+	ok, contents, err := fm4.ParseIfExists(ctx, &Stats{}, nil)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		// expected v4 or v5
+		return false, ErrUnreadableManifest
+	}
+	check := func(upstream, contents manifestContents) error {
+		if upstream.gcGen == contents.gcGen {
+			return errors.New("error migrating manifest")
+		}
+		return nil
+	}
+	contents.gcGen = contents.lock
+	_, err = updateAppendixWithParseWriterAndChecker(ctx, dir, fm5.writeManifest, fm4.parseManifest, check, contents.lock, contents, nil)
+	if err != nil {
+		return false, err
+	}
+	return true, err
+}
+
 // parse the manifest in its given format
 func getFileManifest(ctx context.Context, dir string) (manifest, error) {
 	f, err := openIfExists(filepath.Join(dir, manifestFileName))
@@ -149,8 +190,8 @@ func newLock(dir string) *fslock.Lock {
 	return fslock.New(lockPath)
 }
 
-func lockFileExists(dir string) (bool, error) {
-	lockPath := filepath.Join(dir, lockFileName)
+func lockFileExists(dir string, filename string) (bool, error) {
+	lockPath := filepath.Join(dir, filename)
 	info, err := os.Stat(lockPath)
 
 	if err != nil {
@@ -194,7 +235,13 @@ func (fm5 fileManifestV5) ParseIfExists(ctx context.Context, stats *Stats, readH
 		stats.ReadManifestLatency.SampleTimeSince(t1)
 	}()
 
-	return parseIfExistsWithParser(ctx, fm5.dir, fm5.parseManifest, readHook)
+	var withAppendix bool
+	_, err = os.Stat(filepath.Join(fm5.dir, appendixFileName))
+	if os.IsNotExist(err) {
+		withAppendix = true
+	}
+
+	return parseIfExistsWithParser(ctx, fm5.dir, fm5.parseManifest, withAppendix, readHook)
 }
 
 func (fm5 fileManifestV5) Update(ctx context.Context, lastLock addr, newContents manifestContents, stats *Stats, writeHook func() error) (mc manifestContents, err error) {
@@ -208,7 +255,21 @@ func (fm5 fileManifestV5) Update(ctx context.Context, lastLock addr, newContents
 		return nil
 	}
 
-	return updateWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	// todo this check could happen elsewhere?
+	_, err = os.Stat(filepath.Join(fm5.dir, appendixFileName))
+	if os.IsNotExist(err) {
+		// no appendix exists, only work with manifest
+		return updateWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	}
+
+	updatedManifestContents, err := updateWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	if err != nil {
+		return manifestContents{}, err
+	}
+
+	// silently ignore issues with the appendix
+	updatedAppendixContents, _ := updateAppendixWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	return combineContents(updatedManifestContents, updatedAppendixContents), nil
 }
 
 func (fm5 fileManifestV5) UpdateGCGen(ctx context.Context, lastLock addr, newContents manifestContents, stats *Stats, writeHook func() error) (mc manifestContents, err error) {
@@ -225,7 +286,19 @@ func (fm5 fileManifestV5) UpdateGCGen(ctx context.Context, lastLock addr, newCon
 		return nil
 	}
 
-	return updateWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	// todo: do we care about gc?
+	_, err = os.Stat(filepath.Join(fm5.dir, appendixFileName))
+	if os.IsNotExist(err) {
+		return updateWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	}
+
+	updatedManifestContents, err := updateWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	if err != nil {
+		return manifestContents{}, err
+	}
+
+	updatedAppendixContents, _ := updateAppendixWithParseWriterAndChecker(ctx, fm5.dir, fm5.writeManifest, fm5.parseManifest, checker, lastLock, newContents, writeHook)
+	return combineContents(updatedManifestContents, updatedAppendixContents), nil
 }
 
 func (fm5 fileManifestV5) parseManifest(r io.Reader) (manifestContents, error) {
@@ -297,7 +370,13 @@ func (fm4 fileManifestV4) ParseIfExists(ctx context.Context, stats *Stats, readH
 		stats.ReadManifestLatency.SampleTimeSince(t1)
 	}()
 
-	return parseIfExistsWithParser(ctx, fm4.dir, fm4.parseManifest, readHook)
+	var withAppendix bool
+	_, err = os.Stat(filepath.Join(fm4.dir, appendixFileName))
+	if os.IsNotExist(err) {
+		withAppendix = true
+	}
+
+	return parseIfExistsWithParser(ctx, fm4.dir, fm4.parseManifest, withAppendix, readHook)
 }
 
 func (fm4 fileManifestV4) Update(ctx context.Context, lastLock addr, newContents manifestContents, stats *Stats, writeHook func() error) (mc manifestContents, err error) {
@@ -308,7 +387,17 @@ func (fm4 fileManifestV4) Update(ctx context.Context, lastLock addr, newContents
 		return nil
 	}
 
-	return updateWithParseWriterAndChecker(ctx, fm4.dir, fm4.writeManifest, fm4.parseManifest, noop, lastLock, newContents, writeHook)
+	// todo: better place to check?
+	_, err = os.Stat(filepath.Join(fm4.dir, appendixFileName))
+	if os.IsNotExist(err) {
+		return updateWithParseWriterAndChecker(ctx, fm4.dir, fm4.writeManifest, fm4.parseManifest, noop, lastLock, newContents, writeHook)
+	}
+	updatedManifestContests, err := updateWithParseWriterAndChecker(ctx, fm4.dir, fm4.writeManifest, fm4.parseManifest, noop, lastLock, newContents, writeHook)
+	if err != nil {
+		return manifestContents{}, err
+	}
+	updatedAppendixContents, _ := updateAppendixWithParseWriterAndChecker(ctx, fm4.dir, fm4.writeManifest, fm4.parseManifest, noop, lastLock, newContents, writeHook)
+	return combineContents(updatedManifestContests, updatedAppendixContents), nil
 }
 
 func (fm4 fileManifestV4) parseManifest(r io.Reader) (manifestContents, error) {
@@ -357,9 +446,9 @@ func (fm4 fileManifestV4) writeManifest(temp io.Writer, contents manifestContent
 	return err
 }
 
-func parseIfExistsWithParser(_ context.Context, dir string, parse manifestParser, readHook func() error) (exists bool, contents manifestContents, err error) {
+func parseIfExistsWithParser(_ context.Context, dir string, parse manifestParser, withAppendix bool, readHook func() error) (exists bool, contents manifestContents, err error) {
 	var locked bool
-	locked, err = lockFileExists(dir)
+	locked, err = lockFileExists(dir, lockFileName)
 
 	if err != nil {
 		return false, manifestContents{}, err
@@ -368,17 +457,16 @@ func parseIfExistsWithParser(_ context.Context, dir string, parse manifestParser
 	// !exists(lockFileName) => unitialized store
 	if locked {
 		var f io.ReadCloser
+		var a io.ReadCloser
 		err = func() (ferr error) {
 			lck := newLock(dir)
 			ferr = lck.Lock()
-
 			if ferr != nil {
 				return ferr
 			}
 
 			defer func() {
 				unlockErr := lck.Unlock()
-
 				if ferr == nil {
 					ferr = unlockErr
 				}
@@ -397,6 +485,12 @@ func parseIfExistsWithParser(_ context.Context, dir string, parse manifestParser
 				return ferr
 			}
 
+			if withAppendix {
+				a, ferr = openIfExists(filepath.Join(dir, appendixFileName))
+				if ferr != nil {
+					return ferr
+				}
+			}
 			return nil
 		}()
 
@@ -421,9 +515,57 @@ func parseIfExistsWithParser(_ context.Context, dir string, parse manifestParser
 				return false, contents, err
 			}
 		}
+		if a != nil {
+			defer func() {
+				closeErr := a.Close()
+				if err == nil {
+					err = closeErr
+				}
+			}()
+			appendixContents, err := parse(a)
+			if err != nil {
+				// silently ignore appendix parse errors
+				return exists, contents, nil
+			}
+			contents = combineContents(contents, appendixContents)
+		}
+	}
+	return exists, contents, nil
+}
+
+func combineContents(contents manifestContents, appendixContents manifestContents) manifestContents {
+	// check that the appendixContents fields match the regular manifest, dont wanna mix and match
+	// if they dont match we silently abandon
+	if len(appendixContents.specs) < 1 {
+		return contents
+	}
+	emptyAddr := addr{}
+	if contents.gcGen != emptyAddr && contents.gcGen != appendixContents.gcGen ||
+		contents.vers != appendixContents.vers ||
+		!contents.root.Equal(appendixContents.root) {
+		return contents
+	}
+	specCheckMap := make(map[addr]struct{})
+	for _, is := range contents.specs {
+		specCheckMap[is.name] = struct{}{}
 	}
 
-	return exists, contents, nil
+	// place the addendum's specs at the front
+	// so the manifest reads them first?
+	combinedSpecs := make([]tableSpec, 0)
+	for _, as := range appendixContents.specs {
+		_, ok := specCheckMap[as.name]
+		if !ok {
+			combinedSpecs = append(combinedSpecs, as)
+		}
+	}
+	return manifestContents{
+		vers:  contents.vers,
+		gcGen: contents.gcGen,
+		lock:  contents.lock,
+		root:  contents.root,
+		specs: append(combinedSpecs, contents.specs...),
+	}
 }
 
 func updateWithParseWriterAndChecker(_ context.Context, dir string, write manifestWriter, parse manifestParser, validate manifestChecker, lastLock addr, newContents manifestContents, writeHook func() error) (mc manifestContents, err error) {
@@ -543,5 +685,101 @@ func updateWithParseWriterAndChecker(_ context.Context, dir string, write manife
 		return manifestContents{}, err
 	}
 
+	return newContents, nil
+}
+
+func updateAppendixWithParseWriterAndChecker(_ context.Context, dir string, write manifestWriter, parse manifestParser, validate manifestChecker, lastLock addr, newContents manifestContents, writeHook func() error) (mc manifestContents, err error) {
+	var tempAppendixPath string
+	// Write a temporary appendix file, to be renamed over appendixFileName upon success.
+	// The closure here ensures this file is closed before moving on.
+	tempAppendixPath, err = func() (name string, ferr error) {
+		var temp *os.File
+		temp, ferr = tempfiles.MovableTempFileProvider.NewFile(dir, "nbs_appendix_")
+		if ferr != nil {
+			return "", ferr
+		}
+		defer func() {
+			closeErr := temp.Close()
+			if ferr == nil {
+				ferr = closeErr
+			}
+		}()
+		ferr = write(temp, newContents)
+		if ferr != nil {
+			return "", ferr
+		}
+		return temp.Name(), nil
+	}()
+	if err != nil {
+		return manifestContents{}, err
+	}
+
+	defer os.Remove(tempAppendixPath) // If we rename below, this will be a no-op
+
+	// Take manifest file lock
+	lck := newLock(dir)
+	err = lck.Lock()
+	if err != nil {
+		return manifestContents{}, err
+	}
+	defer func() {
+		unlockErr := lck.Unlock()
+		if err == nil {
+			err = unlockErr
+		}
+	}()
+
+	// writeHook is for testing, allowing other code to slip in and try to do stuff while we hold the lock.
+	if writeHook != nil {
+		err = writeHook()
+		if err != nil {
+			return manifestContents{}, err
+		}
+	}
+
+	var upstream manifestContents
+	// Read current appendix (if it exists). The closure ensures that the file is closed before moving on, so we can rename over it later if need be.
+	appendixPath := filepath.Join(dir, appendixFileName)
+	upstream, err = func() (upstream manifestContents, ferr error) {
+		if f, ferr := openIfExists(appendixPath); ferr == nil && f != nil {
+			defer func() {
+				closeErr := f.Close()
+				if ferr != nil {
+					ferr = closeErr
+				}
+			}()
+			upstream, ferr = parse(f)
+			if ferr != nil {
+				return manifestContents{}, ferr
+			}
+			if newContents.vers != upstream.vers {
+				return manifestContents{}, errors.New("Update cannot change appendix version")
+			}
+			return upstream, nil
+		} else if ferr != nil {
+			return manifestContents{}, ferr
+		}
+		if lastLock != (addr{}) {
+			return manifestContents{}, errors.New("new appendix created with non 0 lock")
+		}
+		return manifestContents{}, nil
+	}()
+	if err != nil {
+		return manifestContents{}, err
+	}
+
+	if lastLock != upstream.lock {
+		return upstream, nil
+	}
+
+	// this is where we assert that gcGen is unchanged
+	err = validate(upstream, newContents)
+	if err != nil {
+		return manifestContents{}, err
+	}
+	err = os.Rename(tempAppendixPath, appendixPath)
+	if err != nil {
+		return manifestContents{}, err
+	}
 	return newContents, nil
 }
